@@ -8,8 +8,8 @@ calling for parsers relying on special-token delimiters (Gemma4):
 1. :class:`Gemma4ToolParser.adjust_request` used an
    ``isinstance(request, ChatCompletionRequest)`` guard, so a
    :class:`ResponsesRequest` with tools never had
-   ``skip_special_tokens`` flipped to ``False``. The default (``True``)
-   stripped ``<|tool_call>`` / ``<tool_call|>`` delimiters, causing
+   ``skip_special_tokens`` flipped to ``False``. The resolved default
+   (``True``) stripped ``<|tool_call>`` / ``<tool_call|>`` delimiters, causing
    :meth:`Gemma4ToolParser.extract_tool_calls_streaming` to fall through
    to the content branch and leak the raw ``call:fn{...}`` body via
    ``response.output_text.delta``.
@@ -100,14 +100,24 @@ def _build_chat_request(
 class _StubTokenizer:
     """Minimal tokenizer stub to satisfy ``Gemma4EngineToolParser.__init__``."""
 
+    _VOCAB: dict[str, int] = {
+        "<|tool_call>": 256_000,
+        "<tool_call|>": 256_001,
+        '<|"|>': 52,
+        "<|channel>": 256_002,
+        "<channel|>": 256_003,
+    }
+
     def get_vocab(self) -> dict[str, int]:
-        return {
-            "<|tool_call>": 256_000,
-            "<tool_call|>": 256_001,
-            '<|"|>': 52,
-            "<|channel>": 256_002,
-            "<channel|>": 256_003,
-        }
+        return dict(self._VOCAB)
+
+    @property
+    def all_special_tokens(self) -> list[str]:
+        return list(self._VOCAB.keys())
+
+    @property
+    def all_special_ids(self) -> list[int]:
+        return list(self._VOCAB.values())
 
 
 def test_gemma4_adjust_request_sets_skip_special_tokens_on_responses() -> None:
@@ -122,8 +132,9 @@ def test_gemma4_adjust_request_sets_skip_special_tokens_on_responses() -> None:
     parser = Gemma4ToolParser(_StubTokenizer())
 
     request = _build_responses_request(tool_choice="auto")
-    assert request.skip_special_tokens is True, (
-        "Precondition: ResponsesRequest.skip_special_tokens default is True"
+    assert request.skip_special_tokens is None, (
+        "Precondition: ResponsesRequest.skip_special_tokens defaults to None "
+        "(resolves to True unless the model's generation config overrides it)"
     )
 
     parser.adjust_request(request)
@@ -161,7 +172,7 @@ def test_tool_parser_adjust_request_builds_valid_response_text_config() -> None:
 
 
 def test_gemma4_required_skips_structured_outputs_chatcompletion() -> None:
-    """required + ChatCompletion: ``Gemma4EngineToolParser`` must skip the
+    """Required + ChatCompletion: ``Gemma4EngineToolParser`` must skip the
     forced JSON ``structured_outputs`` so the model emits its native
     ``<|tool_call>`` syntax. The base parser constrained output to JSON the
     native parser cannot read, leaking it as content with empty
@@ -177,7 +188,7 @@ def test_gemma4_required_skips_structured_outputs_chatcompletion() -> None:
 
 
 def test_gemma4_named_skips_structured_outputs_chatcompletion() -> None:
-    """named + ChatCompletion: the forced single-function JSON schema must be
+    """Named + ChatCompletion: the forced single-function JSON schema must be
     skipped, same as ``required``.
     """
     parser = Gemma4ToolParser(_StubTokenizer())
@@ -192,7 +203,7 @@ def test_gemma4_named_skips_structured_outputs_chatcompletion() -> None:
 
 
 def test_gemma4_required_skips_structured_outputs_responses() -> None:
-    """required + Responses: the forced JSON schema (``request.text``) must be
+    """Required + Responses: the forced JSON schema (``request.text``) must be
     skipped so the native delimiters reach the extractor.
     """
     parser = Gemma4ToolParser(_StubTokenizer())
@@ -205,7 +216,7 @@ def test_gemma4_required_skips_structured_outputs_responses() -> None:
 
 
 def test_gemma4_named_skips_structured_outputs_responses() -> None:
-    """named (``ToolChoiceFunction``) + Responses: the forced single-function
+    """Named (``ToolChoiceFunction``) + Responses: the forced single-function
     JSON schema must be skipped.
     """
     parser = Gemma4ToolParser(_StubTokenizer())
@@ -220,7 +231,7 @@ def test_gemma4_named_skips_structured_outputs_responses() -> None:
 
 
 def test_gemma4_keeps_special_tokens_with_tools_thinking_disabled() -> None:
-    """tools active + thinking disabled: ``skip_special_tokens`` must stay
+    """Tools active + thinking disabled: ``skip_special_tokens`` must stay
     False so ``<|tool_call>`` delimiters reach the extractor. The merged
     enable_thinking early-return stripped them, breaking tool calling when
     thinking is off.
@@ -235,10 +246,10 @@ def test_gemma4_keeps_special_tokens_with_tools_thinking_disabled() -> None:
     assert request.skip_special_tokens is False
 
 
-def test_gemma4_strips_special_tokens_when_nothing_to_preserve() -> None:
-    """No active tools + thinking disabled: keep the default
-    (``skip_special_tokens=True``) so stray delimiters do not leak into
-    content.
+def test_gemma4_keeps_skip_special_tokens_false_when_nothing_to_preserve() -> None:
+    """No active tools + thinking disabled: ``skip_special_tokens`` stays
+    ``False`` because the parser engine's ``__DROP__`` terminal mechanism
+    strips unconfigured special tokens automatically.
     """
     parser = Gemma4ToolParser(_StubTokenizer())
     request = _build_chat_request(
@@ -247,4 +258,4 @@ def test_gemma4_strips_special_tokens_when_nothing_to_preserve() -> None:
 
     parser.adjust_request(request)
 
-    assert request.skip_special_tokens is True
+    assert request.skip_special_tokens is False

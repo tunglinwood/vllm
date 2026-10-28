@@ -8,6 +8,7 @@ from vllm import _custom_ops as ops
 from vllm import envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
@@ -90,7 +91,7 @@ def grouped_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
         envs.VLLM_USE_FUSED_MOE_GROUPED_TOPK
-        and current_platform.is_cuda()
+        and (current_platform.is_cuda() or current_platform.is_xpu())
         and num_expert_group <= 32
         and topk <= 32
         and e_score_correction_bias is not None
@@ -258,6 +259,7 @@ class GroupedTopKRouter(BaseRouter):
         e_score_correction_bias: torch.Tensor | None = None,
         num_fused_shared_experts: int = 0,
         eplb_state: EplbLayerState | None = None,
+        skip_padding: bool = False,
     ):
         super().__init__(
             top_k=top_k,
@@ -271,6 +273,7 @@ class GroupedTopKRouter(BaseRouter):
         self.routed_scaling_factor = routed_scaling_factor
         self.e_score_correction_bias = e_score_correction_bias
         self.num_fused_shared_experts = num_fused_shared_experts
+        self.skip_padding = skip_padding
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
@@ -280,7 +283,6 @@ class GroupedTopKRouter(BaseRouter):
             renormalize=self.renormalize,
             num_expert_group=self.num_expert_group,
             has_e_score_bias=self.e_score_correction_bias is not None,
-            routed_scaling_factor=self.routed_scaling_factor,
         )
 
     def _compute_routing(
@@ -290,7 +292,7 @@ class GroupedTopKRouter(BaseRouter):
         indices_type: torch.dtype | None,
         *,
         input_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using grouped top-k."""
 
         def valid_grouping() -> bool:
@@ -303,7 +305,7 @@ class GroupedTopKRouter(BaseRouter):
 
         if not valid_grouping():
             if self.e_score_correction_bias is not None:
-                topk_weights, topk_ids, _ = fused_topk_bias(
+                topk_weights, topk_ids = fused_topk_bias(
                     hidden_states=hidden_states,
                     gating_output=router_logits,
                     scoring_func=self.scoring_func,
@@ -321,7 +323,7 @@ class GroupedTopKRouter(BaseRouter):
                     renormalize=self.renormalize,
                     indices_type=indices_type,
                 )
-            return topk_weights, topk_ids, None
+            return topk_weights, topk_ids
 
         # Select grouped_topk implementation
         if rocm_aiter_ops.is_fused_moe_enabled():
@@ -346,4 +348,15 @@ class GroupedTopKRouter(BaseRouter):
             e_score_correction_bias=self.e_score_correction_bias,
         )
 
-        return topk_weights, topk_ids, None
+        if (
+            self.skip_padding
+            and envs.VLLM_MOE_SKIP_PADDING
+            and is_forward_context_available()
+        ):
+            is_padding = get_forward_context().is_padding
+            if is_padding is not None:
+                is_padding = is_padding[: topk_ids.shape[0]].unsqueeze(1)
+                topk_weights = topk_weights.masked_fill(is_padding, 0)
+                topk_ids = topk_ids.masked_fill(is_padding, -1)
+
+        return topk_weights, topk_ids
