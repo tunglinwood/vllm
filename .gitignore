@@ -264,3 +264,9 @@ scripts/test_*.sh
 scripts/test_*.py
 scripts/verify_*.py
 scripts/final_verification.py
+
+# Written by .buildkite/scripts/rocm/build.sh
+/.rocm-src/
+/.rocm-version/
+/.rocm-wheel/
+/.rocm-kernel-map/
